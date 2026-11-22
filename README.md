@@ -60,6 +60,14 @@ Tabula helps you extract tables from PDFs
                             extraction (if there are ruling lines
                             separating each cell, as in a PDF of an Excel
                             spreadsheet)
+ -R,--rates <RATE_CSV>      Join an external rate CSV to the extracted
+                            waybill tables. The CSV header must contain
+                            '生效日', '失效日' and '费率'; its other columns
+                            (e.g. '线路', '计费档') are matched by name
+                            against the first row of each table. For every
+                            detail row the effective date and rate valid on
+                            its '运送日期' (YYYY-MM-DD) are appended, in
+                            order. Default: disabled
  -s,--password <PASSWORD>   Password to decrypt document. Default is empty
  -t,--stream                Force PDF to be extracted using stream-mode
                             extraction (if there are no ruling lines
@@ -70,6 +78,23 @@ Tabula helps you extract tables from PDFs
 ```
 
 It also includes a debugging tool, run `java -cp ./target/tabula-1.0.5-jar-with-dependencies.jar technology.tabula.debug.Debug -h` for the available options.
+
+### Joining an external rate table
+
+Historical waybills often need the rate that was in force on the shipment date, not today's rate. Pass `-R/--rates` with a CSV such as:
+
+```csv
+线路,计费档,生效日,失效日,费率
+SZX-PEK,1,2024-01-01,2024-07-01,10.5
+SZX-PEK,1,2024-07-01,,12
+```
+
+* `生效日`/`失效日` are `YYYY-MM-DD`. The interval includes the effective date and excludes the expiry date; an empty `失效日` means the rate never expires.
+* The CSV's other columns are join keys. Only the keys whose names also appear in the first row of an extracted table are used, so extra columns are harmless.
+* Records of one key may be adjacent (`失效日` == next `生效日`) but must not overlap. Invalid dates or overlapping/illegal intervals abort the run with the offending **CSV line number**.
+* The rate table is loaded once and indexed into per-key validity intervals, so joining a document does not re-scan it per waybill row.
+* Each detail row keeps its original position and gets two appended columns: the matched effective date and the rate. Rows with no match or an invalid `运送日期` leave those columns empty and are reported on stderr as `Rate join: page N, row M: ...`.
+* Without `-R`, output is exactly what it was before.
 
 You can also integrate `tabula-java` with any JVM language. For Java examples, see the [`tests`](src/test/java/technology/tabula/) folder.
 

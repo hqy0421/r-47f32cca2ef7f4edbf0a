@@ -22,6 +22,11 @@ import technology.tabula.detectors.DetectionAlgorithm;
 import technology.tabula.detectors.NurminenDetectionAlgorithm;
 import technology.tabula.extractors.BasicExtractionAlgorithm;
 import technology.tabula.extractors.SpreadsheetExtractionAlgorithm;
+import technology.tabula.rate.RateColumns;
+import technology.tabula.rate.RateCsvException;
+import technology.tabula.rate.RateJoin;
+import technology.tabula.rate.RateJoinDiagnostic;
+import technology.tabula.rate.RateTable;
 import technology.tabula.writers.CSVWriter;
 import technology.tabula.writers.JSONWriter;
 import technology.tabula.writers.TSVWriter;
@@ -44,6 +49,8 @@ public class CommandLineApp {
     private List<Integer> pages;
     private OutputFormat outputFormat;
     private String password;
+    private String ratesPath;
+    private boolean silent;
     private TableExtractor tableExtractor;
 
     public CommandLineApp(Appendable defaultOutput, CommandLine line) throws ParseException {
@@ -52,9 +59,16 @@ public class CommandLineApp {
         this.pages = CommandLineApp.whichPages(line);
         this.outputFormat = CommandLineApp.whichOutputFormat(line);
         this.tableExtractor = CommandLineApp.createExtractor(line);
+        this.silent = line.hasOption('i');
 
         if (line.hasOption('s')) {
             this.password = line.getOptionValue('s');
+        }
+
+        if (line.hasOption('R')) {
+            this.ratesPath = line.getOptionValue('R');
+        } else if (line.hasOption("rate-csv")) {
+            this.ratesPath = line.getOptionValue("rate-csv");
         }
     }
 
@@ -83,6 +97,8 @@ public class CommandLineApp {
     }
 
     public void extractTables(CommandLine line) throws ParseException {
+        RateTable rateTable = loadRateTable();
+
         if (line.hasOption('b')) {
             if (line.getArgs().length != 0) {
                 throw new ParseException("Filename specified with batch\nTry --help for help");
@@ -92,7 +108,7 @@ public class CommandLineApp {
             if (!pdfDirectory.isDirectory()) {
                 throw new ParseException("Directory does not exist or is not a directory");
             }
-            extractDirectoryTables(line, pdfDirectory);
+            extractDirectoryTables(line, pdfDirectory, rateTable);
             return;
         }
 
@@ -104,10 +120,39 @@ public class CommandLineApp {
         if (!pdfFile.exists()) {
             throw new ParseException("File does not exist");
         }
-        extractFileTables(line, pdfFile);
+        extractFileTables(line, pdfFile, rateTable);
+    }
+
+    /**
+     * Loads the optional external rate CSV once per command invocation, so
+     * neither batch mode nor the row-level join re-reads it per document.
+     */
+    private RateTable loadRateTable() throws ParseException {
+        if (this.ratesPath == null) {
+            return null;
+        }
+        File ratesFile = new File(this.ratesPath);
+        if (!ratesFile.exists()) {
+            throw new ParseException("Rate CSV does not exist: " + this.ratesPath);
+        }
+        if (!ratesFile.isFile()) {
+            throw new ParseException("Rate CSV is not a file: " + this.ratesPath);
+        }
+        try {
+            return RateTable.load(ratesFile);
+        } catch (RateCsvException e) {
+            throw new ParseException("Invalid rate CSV: " + e.getMessage());
+        } catch (IOException e) {
+            throw new ParseException("Cannot read rate CSV " + this.ratesPath + ": " + e.getMessage());
+        }
     }
 
     public void extractDirectoryTables(CommandLine line, File pdfDirectory) throws ParseException {
+        extractDirectoryTables(line, pdfDirectory, loadRateTable());
+    }
+
+    public void extractDirectoryTables(CommandLine line, File pdfDirectory, RateTable rateTable)
+            throws ParseException {
         File[] pdfs = pdfDirectory.listFiles(new FilenameFilter() {
             public boolean accept(File dir, String name) {
                 return name.endsWith(".pdf");
@@ -117,7 +162,7 @@ public class CommandLineApp {
         for (File pdfFile : pdfs) {
           File outputFile = new File(getOutputFilename(pdfFile));
           try {
-            extractFileInto(pdfFile, outputFile);
+            extractFileInto(pdfFile, outputFile, rateTable);
           } catch (ParseException e) {
             System.err.println("Caught exception while processing file: " + pdfFile.toString());
             throw e;
@@ -126,23 +171,33 @@ public class CommandLineApp {
     }
 
     public void extractFileTables(CommandLine line, File pdfFile) throws ParseException {
+        extractFileTables(line, pdfFile, loadRateTable());
+    }
+
+    public void extractFileTables(CommandLine line, File pdfFile, RateTable rateTable)
+            throws ParseException {
         if (!line.hasOption('o')) {
-            extractFile(pdfFile, this.defaultOutput);
+            extractFile(pdfFile, this.defaultOutput, rateTable);
             return;
         }
 
         File outputFile = new File(line.getOptionValue('o'));
-        extractFileInto(pdfFile, outputFile);
+        extractFileInto(pdfFile, outputFile, rateTable);
     }
 
     public void extractFileInto(File pdfFile, File outputFile) throws ParseException {
+        extractFileInto(pdfFile, outputFile, loadRateTable());
+    }
+
+    public void extractFileInto(File pdfFile, File outputFile, RateTable rateTable)
+            throws ParseException {
         BufferedWriter bufferedWriter = null;
         try {
             FileWriter fileWriter = new FileWriter(outputFile.getAbsoluteFile());
             bufferedWriter = new BufferedWriter(fileWriter);
 
             outputFile.createNewFile();
-            extractFile(pdfFile, bufferedWriter);
+            extractFile(pdfFile, bufferedWriter, rateTable);
         } catch (IOException e) {
             throw new ParseException("Cannot create file " + outputFile);
         } finally {
@@ -157,6 +212,10 @@ public class CommandLineApp {
     }
 
     private void extractFile(File pdfFile, Appendable outFile) throws ParseException {
+        extractFile(pdfFile, outFile, null);
+    }
+
+    private void extractFile(File pdfFile, Appendable outFile, RateTable rateTable) throws ParseException {
         PDDocument pdfDocument = null;
         try {
             pdfDocument = this.password == null ?  Loader.loadPDF(pdfFile) :  Loader.loadPDF(pdfFile,password);
@@ -186,7 +245,13 @@ public class CommandLineApp {
                     tables.addAll(tableExtractor.extractTables(page));
                 }
             }
+            if (rateTable != null) {
+                RateJoin.Result result = RateJoin.apply(tables, rateTable);
+                reportRateDiagnostics(result);
+            }
             writeTables(tables, outFile);
+        } catch (RateCsvException e) {
+            throw new ParseException("Invalid rate CSV: " + e.getMessage());
         } catch (IOException e) {
             throw new ParseException(e.getMessage());
         } finally {
@@ -205,6 +270,20 @@ public class CommandLineApp {
         return (pages == null) ?
                 extractor.extract() :
                 extractor.extract(pages);
+    }
+
+    /**
+     * Reports rows that could not be joined to a rate on stderr, using the PDF
+     * page and the row number inside the extracted table. Output on stdout (or
+     * the -o file) is unaffected.
+     */
+    private void reportRateDiagnostics(RateJoin.Result result) {
+        if (silent || result == null || !result.hasDiagnostics()) {
+            return;
+        }
+        for (RateJoinDiagnostic diagnostic : result.getDiagnostics()) {
+            System.err.println("Rate join: " + diagnostic);
+        }
     }
 
     // CommandLine parsing methods
@@ -363,6 +442,23 @@ public class CommandLineApp {
                 .desc("Comma separated list of ranges, or all. Examples: --pages 1-3,5-7, --pages 3 or --pages all. Default is --pages 1")
                 .hasArg()
                 .argName("PAGES")
+                .build());
+        o.addOption(Option.builder("R")
+                .longOpt("rates")
+                .desc("Join an external rate CSV to the extracted waybill tables. The CSV header must contain "
+                        + "'" + RateColumns.EFFECTIVE + "', '" + RateColumns.EXPIRY + "' and '" + RateColumns.RATE
+                        + "'; its other columns (e.g. '" + RateColumns.LANE + "', '" + RateColumns.BILLING_BAND
+                        + "') are matched by name against the first row of each table. For every detail row the "
+                        + "effective date and rate valid on its '" + RateColumns.SHIPMENT_DATE + "' (YYYY-MM-DD) "
+                        + "are appended, in order. Default: disabled")
+                .hasArg()
+                .argName("RATE_CSV")
+                .build());
+        o.addOption(Option.builder()
+                .longOpt("rate-csv")
+                .desc("Alias for -R/--rates.")
+                .hasArg()
+                .argName("RATE_CSV")
                 .build());
 
         return o;
